@@ -1,34 +1,69 @@
 """
 Benjelyn Reves Patiag
 Week 8 - Activity 3
-AI CV ATS Analyzer (Single File Version)
+AI CV ATS Analyzer (single-file version)
 
-Features:
-- CV vs Job Description comparison
-- ATS keyword matching + AI recommendations
-- Hardcoded API key for demo
+What this script do (simple):
+- Read CV + Job Description from PDF / DOCX / TXT
+- Compute simple ATS keyword match score
+- Ask LLM (Gemini or OpenAI) for improvement suggestions (optional)
+
+Notes:
+- API keys are NOT hardcoded (use environment variables)
+- Optional libs (pdfplumber / python-docx / google-genai / openai) are imported safely
 """
 
+from __future__ import annotations
 
 import os
 import re
+from collections import Counter
 from dataclasses import dataclass
-from typing import List, Protocol
+from pathlib import Path
+from typing import Final, List, Optional, Protocol
 
 
 # =====================================================
-# 0) CONFIGURATION (FOR CLASS DEMO ONLY)
+# 0) CONFIGURATION
 # =====================================================
 
-LLM_PROVIDER = "gemini"   # "gemini" or "openai"
+LLM_PROVIDER: Final[str] = os.getenv("LLM_PROVIDER", "gemini").strip().lower()
 
-# ---- Gemini ----
-GEMINI_API_KEY = "your_gemini_api_key_here"  # Replace with your actual Gemini API key
-GEMINI_MODEL = "gemini-2.0-flash"
+# Gemini
+GEMINI_API_KEY: Final[str] = os.getenv("GEMINI_API_KEY", "").strip()
+GEMINI_MODEL: Final[str] = os.getenv("GEMINI_MODEL", "gemini-2.0-flash").strip()
 
-# ---- OpenAI (optional) ----
-OPENAI_API_KEY = ""
-OPENAI_MODEL = "gpt-4.1-mini"
+# OpenAI
+OPENAI_API_KEY: Final[str] = os.getenv("OPENAI_API_KEY", "").strip()
+OPENAI_MODEL: Final[str] = os.getenv("OPENAI_MODEL", "gpt-4.1-mini").strip()
+
+SUPPORTED_EXTS: Final[set[str]] = {".pdf", ".docx", ".txt"}
+
+STOPWORDS: Final[frozenset[str]] = frozenset(
+    {
+        "and",
+        "or",
+        "the",
+        "a",
+        "an",
+        "to",
+        "for",
+        "of",
+        "in",
+        "on",
+        "with",
+        "as",
+        "at",
+        "by",
+        "is",
+        "are",
+        "be",
+        "this",
+        "that",
+    }
+)
+
+TOKEN_PATTERN: Final[re.Pattern[str]] = re.compile(r"[A-Za-z][A-Za-z\+\#\.\-]{1,}")
 
 
 # =====================================================
@@ -37,84 +72,83 @@ OPENAI_MODEL = "gpt-4.1-mini"
 
 
 class TextExtractor:
-    """Base extractor class (interface style)."""
+    """Base extractor interface."""
 
-    def extract(self, file_path: str) -> str:
-        """Extract text content from the given file path."""
+    def extract(self, file_path: Path) -> str:
+        """Read text from the given file path."""
         raise NotImplementedError
 
 
 class PDFTextExtractor(TextExtractor):
-    """Extract text from PDF files."""
+    """Extracts text from PDF files."""
 
-    def extract(self, file_path: str) -> str:
-        """Read PDF and return extracted text."""
-        # disable=import-outside-toplevel
-        import pdfplumber
+    def extract(self, file_path: Path) -> str:
+        try:
+            import pdfplumber  # type: ignore
+        except ImportError as exc:  # pragma: no cover
+            raise ImportError(
+                "Missing dependency: pdfplumber. Install with: pip install pdfplumber"
+            ) from exc
 
-        text = ""
-        with pdfplumber.open(file_path) as pdf:
+        text_parts: list[str] = []
+        with pdfplumber.open(str(file_path)) as pdf:
             for page in pdf.pages:
-                text += (page.extract_text() or "") + "\n"
-        return text.strip()
+                text_parts.append((page.extract_text() or "").strip())
+        return "\n".join(p for p in text_parts if p).strip()
 
 
 class DOCXTextExtractor(TextExtractor):
-    """Extract text from DOCX files."""
+    """Extracts text from DOCX files."""
 
-    def extract(self, file_path: str) -> str:
-        """Read DOCX and return extracted text."""
-        # disable=import-outside-toplevel
-        import docx
+    def extract(self, file_path: Path) -> str:
+        try:
+            import docx  # type: ignore
+        except ImportError as exc:  # pragma: no cover
+            raise ImportError(
+                "Missing dependency: python-docx. Install with: pip install python-docx"
+            ) from exc
 
-        d = docx.Document(file_path)
-        return "\n".join(p.text for p in d.paragraphs).strip()
+        document = docx.Document(str(file_path))
+        return "\n".join(p.text for p in document.paragraphs).strip()
 
 
 class TXTTextExtractor(TextExtractor):
-    """Extract text from TXT files."""
+    """Extracts text from TXT files."""
 
-    def extract(self, file_path: str) -> str:
-        """Read TXT and return extracted text."""
-        with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
-            return f.read().strip()
+    def extract(self, file_path: Path) -> str:
+        return file_path.read_text(encoding="utf-8", errors="ignore").strip()
 
 
 class ExtractorFactory:
-    """Factory for choosing the correct extractor."""
+    """Factory to choose the correct extractor."""
 
     @staticmethod
-    def get(file_path: str) -> TextExtractor:
-        """Return the right extractor based on file extension."""
-        ext = os.path.splitext(file_path.lower())[1]
+    def get(file_path: Path) -> TextExtractor:
+        """Return correct extractor based on file extension."""
+        ext = file_path.suffix.lower()
         if ext == ".pdf":
             return PDFTextExtractor()
         if ext == ".docx":
             return DOCXTextExtractor()
         if ext == ".txt":
             return TXTTextExtractor()
-        raise ValueError("Unsupported file format. Use PDF, DOCX, or TXT.")
+        raise ValueError(f"Unsupported file format: {ext}. Use PDF, DOCX, or TXT.")
 
 
 # =====================================================
 # 2) ATS SCORING (OOP)
 # =====================================================
 
-STOPWORDS = {
-    "and", "or", "the", "a", "an", "to", "for", "of", "in", "on",
-    "with", "as", "at", "by", "is", "are", "be", "this", "that"
-}
-
 
 def tokenize(text: str) -> List[str]:
-    """Tokenize text for ATS keyword matching."""
-    words = re.findall(r"[A-Za-z][A-Za-z\+\#\.\-]{1,}", text.lower())
+    """Convert text into keyword tokens (simple ATS-style)."""
+    words = TOKEN_PATTERN.findall(text.lower())
     return [w for w in words if w not in STOPWORDS and len(w) >= 2]
 
 
-@dataclass
+@dataclass(frozen=True, slots=True)
 class ATSResult:
-    """ATS scoring result container."""
+    """Result of ATS scoring."""
 
     score_percent: int
     matched_keywords: List[str]
@@ -122,28 +156,27 @@ class ATSResult:
 
 
 class ATSScorer:
-    """
-    Simple ATS scoring:
-    - Extract top keywords from Job Description
-    - Measure overlap with CV
-    """
+    """Simple ATS scoring using keyword overlap."""
 
     def score(self, cv_text: str, jd_text: str, top_n: int = 30) -> ATSResult:
-        """Compute ATS keyword overlap score and return ATSResult."""
+        """Score a CV vs Job Description using keyword overlap."""
+        if top_n <= 0:
+            raise ValueError("top_n must be > 0")
+
         cv_tokens = set(tokenize(cv_text))
         jd_tokens = tokenize(jd_text)
 
-        freq: dict[str, int] = {}
-        for w in jd_tokens:
-            freq[w] = freq.get(w, 0) + 1
+        if not jd_tokens:
+            return ATSResult(score_percent=0, matched_keywords=[], missing_keywords=[])
 
-        top_keywords = sorted(freq, key=freq.get, reverse=True)[:top_n]
+        freq = Counter(jd_tokens)
+        top_keywords = [w for w, _ in freq.most_common(top_n)]
+
         matched = [k for k in top_keywords if k in cv_tokens]
         missing = [k for k in top_keywords if k not in cv_tokens]
 
-        score = 0 if not top_keywords else int((len(matched) / len(top_keywords)) * 100)
-
-        return ATSResult(score, matched, missing)
+        score = int((len(matched) / len(top_keywords)) * 100) if top_keywords else 0
+        return ATSResult(score_percent=score, matched_keywords=matched, missing_keywords=missing)
 
 
 # =====================================================
@@ -152,50 +185,53 @@ class ATSScorer:
 
 
 class LLMClient(Protocol):
-    """Protocol for LLM clients."""
+    """LLM client protocol."""
 
     def generate(self, prompt: str) -> str:
-        """Generate response text based on prompt."""
-        ...
+        """Generate text response from prompt."""
+        raise NotImplementedError
 
 
 class GeminiClient:
-    """Gemini client implementation."""
+    """Gemini LLM client wrapper (google-genai)."""
 
-    def __init__(self) -> None:
-        # disable=import-outside-toplevel
-        from google import genai
+    def __init__(self, api_key: str, model: str) -> None:
+        if not api_key:
+            raise ValueError("GEMINI_API_KEY is missing. Set it in your environment.")
+        self._model = model
 
-        if not GEMINI_API_KEY:
-            raise ValueError("Gemini API key not set in main.py")
-        self.client = genai.Client(api_key=GEMINI_API_KEY)
-        self.model = GEMINI_MODEL
+        try:
+            from google import genai  # type: ignore
+        except ImportError as exc:  # pragma: no cover
+            raise ImportError(
+                "Missing dependency: google-genai. Install with: pip install google-genai"
+            ) from exc
+
+        self._client = genai.Client(api_key=api_key)
 
     def generate(self, prompt: str) -> str:
-        """Call Gemini model and return text response."""
-        response = self.client.models.generate_content(
-            model=self.model,
-            contents=prompt
-        )
-        return (response.text or "").strip()
+        response = self._client.models.generate_content(model=self._model, contents=prompt)
+        return (getattr(response, "text", "") or "").strip()
 
 
 class OpenAIClient:
-    """OpenAI client implementation."""
+    """OpenAI LLM client wrapper (openai python sdk)."""
 
-    def __init__(self) -> None:
-        # disable=import-outside-toplevel
-        from openai import OpenAI
+    def __init__(self, api_key: str, model: str) -> None:
+        if not api_key:
+            raise ValueError("OPENAI_API_KEY is missing. Set it in your environment.")
+        self._model = model
 
-        if not OPENAI_API_KEY:
-            raise ValueError("OpenAI API key not set in main.py")
-        self.client = OpenAI(api_key=OPENAI_API_KEY)
-        self.model = OPENAI_MODEL
+        try:
+            from openai import OpenAI  # type: ignore
+        except ImportError as exc:  # pragma: no cover
+            raise ImportError("Missing dependency: openai. Install with: pip install openai") from exc
+
+        self._client = OpenAI(api_key=api_key)
 
     def generate(self, prompt: str) -> str:
-        """Call OpenAI chat completion and return text response."""
-        response = self.client.chat.completions.create(
-            model=self.model,
+        response = self._client.chat.completions.create(
+            model=self._model,
             messages=[
                 {"role": "system", "content": "You are an expert ATS resume reviewer."},
                 {"role": "user", "content": prompt},
@@ -206,14 +242,19 @@ class OpenAIClient:
 
 
 class LLMFactory:
-    """Factory to build a chosen LLM client."""
+    """Factory to create chosen LLM client."""
 
     @staticmethod
-    def create() -> LLMClient:
-        """Create the LLM client based on LLM_PROVIDER."""
-        if LLM_PROVIDER.lower() == "openai":
-            return OpenAIClient()
-        return GeminiClient()
+    def create() -> Optional[LLMClient]:
+        """Create LLM client. Return None if API key is missing."""
+        if LLM_PROVIDER == "openai":
+            if not OPENAI_API_KEY:
+                return None
+            return OpenAIClient(api_key=OPENAI_API_KEY, model=OPENAI_MODEL)
+
+        if not GEMINI_API_KEY:
+            return None
+        return GeminiClient(api_key=GEMINI_API_KEY, model=GEMINI_MODEL)
 
 
 # =====================================================
@@ -222,54 +263,58 @@ class LLMFactory:
 
 
 class CVAnalyzerApp:
-    """Main application class for CV vs JD analysis."""
+    """Main CLI app to analyze CV vs Job Description."""
 
     def __init__(self) -> None:
-        self.scorer = ATSScorer()
-        self.llm = LLMFactory.create()
+        self._scorer = ATSScorer()
+        self._llm = LLMFactory.create()
 
-    def read_text(self, path: str) -> str:
-        """Read and extract text from file path."""
-        if not os.path.exists(path):
+    @staticmethod
+    def _read_text(path_str: str) -> str:
+        """Read text from a file path string."""
+        path = Path(path_str.strip().strip('"')).expanduser()
+
+        if not path.exists():
             raise FileNotFoundError(f"File not found: {path}")
+
+        if path.suffix.lower() not in SUPPORTED_EXTS:
+            raise ValueError(f"Unsupported file type: {path.suffix}. Use PDF/DOCX/TXT.")
+
         extractor = ExtractorFactory.get(path)
         return extractor.extract(path)
 
-    def build_prompt(self, cv_text: str, jd_text: str, ats: ATSResult) -> str:
-        """Build LLM prompt using CV, JD, and ATS result."""
-        return f"""
-You are an ATS expert and professional recruiter.
-
-Analyze the CV against the Job Description and provide improvements.
-
-Format your answer as:
-1) ATS Summary (2–3 lines)
-2) Missing Keywords (bullet list)
-3) Skills Section Improvements
-4) Experience Bullet Improvements (use STAR)
-5) Two rewritten achievement bullet examples
-
-ATS Score: {ats.score_percent}%
-Missing Keywords: {", ".join(ats.missing_keywords[:15])}
-
-JOB DESCRIPTION:
-{jd_text}
-
-CV:
-{cv_text}
-""".strip()
+    @staticmethod
+    def _build_prompt(cv_text: str, jd_text: str, ats: ATSResult) -> str:
+        """Build prompt for LLM."""
+        missing_preview = ", ".join(ats.missing_keywords[:15])
+        return (
+            "You are an ATS expert and professional recruiter.\n\n"
+            "Analyze the CV against the Job Description and provide improvements.\n\n"
+            "Format your answer as:\n"
+            "1) ATS Summary (2–3 lines)\n"
+            "2) Missing Keywords (bullet list)\n"
+            "3) Skills Section Improvements\n"
+            "4) Experience Bullet Improvements (use STAR)\n"
+            "5) Two rewritten achievement bullet examples\n\n"
+            f"ATS Score: {ats.score_percent}%\n"
+            f"Missing Keywords: {missing_preview}\n\n"
+            "JOB DESCRIPTION:\n"
+            f"{jd_text}\n\n"
+            "CV:\n"
+            f"{cv_text}\n"
+        ).strip()
 
     def run(self) -> None:
-        """Run the CLI app."""
+        """Run CLI flow."""
         print("=== AI CV Analyzer (CV vs Job Description) ===")
 
-        cv_path = input("Enter CV file path (PDF/DOCX/TXT): ").strip().strip('"')
-        jd_path = input("Enter Job Description file path (PDF/DOCX/TXT): ").strip().strip('"')
+        cv_path = input("Enter CV file path (PDF/DOCX/TXT): ").strip()
+        jd_path = input("Enter Job Description file path (PDF/DOCX/TXT): ").strip()
 
-        cv_text = self.read_text(cv_path)
-        jd_text = self.read_text(jd_path)
+        cv_text = self._read_text(cv_path)
+        jd_text = self._read_text(jd_path)
 
-        ats = self.scorer.score(cv_text, jd_text)
+        ats = self._scorer.score(cv_text, jd_text)
 
         print("\n--- ATS Quick Result ---")
         print(f"ATS Match Score: {ats.score_percent}%")
@@ -277,8 +322,12 @@ CV:
         print("Missing keywords:", ", ".join(ats.missing_keywords[:10]) or "None")
 
         print("\n--- AI Recommendations ---")
-        prompt = self.build_prompt(cv_text, jd_text, ats)
-        advice = self.llm.generate(prompt)
+        if self._llm is None:
+            print("LLM is disabled (missing API key). Set GEMINI_API_KEY or OPENAI_API_KEY.")
+            return
+
+        prompt = self._build_prompt(cv_text, jd_text, ats)
+        advice = self._llm.generate(prompt)
         print(advice)
 
 
@@ -287,17 +336,19 @@ CV:
 # =====================================================
 
 
-def main() -> None:
-    """Entry point wrapper."""
+def main() -> int:
+    """Program entry point. Return 0 if ok else 1."""
     try:
         CVAnalyzerApp().run()
-    except Exception as e:  # disable=broad-except
-        print("\nERROR:", e)
+        return 0
+    except (FileNotFoundError, ValueError, ImportError, OSError) as exc:
+        print("\nERROR:", exc)
         print("\nCheck:")
         print("- File paths are correct")
         print("- Required libraries installed")
-        print("- API key pasted correctly in main.py")
+        print("- API keys set in environment variables (if using LLM)")
+        return 1
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
